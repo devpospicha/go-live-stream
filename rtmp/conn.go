@@ -108,7 +108,7 @@ func NewConn(c net.Conn, newStreamer chan *Conn, newViewer chan *Conn) *Conn {
 		newViewer:        newViewer,
 		channelCreated:   make(chan bool),
 		broadcast:        make(chan *Packet, packetBufLen),
-		player:           make(chan *Chunk),
+		player:           make(chan *Chunk, 25),
 		quit:             make(chan bool),
 	}
 }
@@ -758,7 +758,17 @@ func (c *Conn) broadcastVideo() {
 				for _, viewer := range viewers {
 					select {
 					case viewer.player <- chunk:
-						continue
+						// Packet sent successfully
+					default:
+						// Log that the packet is being dropped for this specific viewer
+						if viewer.info != nil {
+							log.WithFields(log.Fields{
+								"streamName": viewer.info.Name,
+								"viewerAddr": viewer.RemoteAddr().String(),
+							}).Warn("Dropping packet for viewer; player buffer full.")
+						} else {
+							log.WithField("viewerAddr", viewer.RemoteAddr().String()).Warn("Dropping packet for anonymous viewer; player buffer full.")
+						}
 					}
 				}
 				c.channel.lock.RUnlock()
