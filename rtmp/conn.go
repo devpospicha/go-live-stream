@@ -2,6 +2,7 @@ package rtmp
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"net"
 
@@ -90,6 +91,7 @@ type Conn struct {
 	broadcast      chan *Packet // Channel to deliver streaming video and audio packets
 	player         chan *Chunk  // Channel to receive decoded streaming video and audio chunks
 	quit           chan bool    // Quit notify channel
+
 }
 
 func NewConn(c net.Conn, newStreamer chan *Conn, newViewer chan *Conn) *Conn {
@@ -108,11 +110,10 @@ func NewConn(c net.Conn, newStreamer chan *Conn, newViewer chan *Conn) *Conn {
 		newViewer:        newViewer,
 		channelCreated:   make(chan bool),
 		broadcast:        make(chan *Packet, packetBufLen),
-		player:           make(chan *Chunk, 25),
+		player:           make(chan *Chunk, 5),
 		quit:             make(chan bool),
 	}
 }
-
 func (c *Conn) Serve() {
 	// Each connection has a default chunk stream
 	cs := NewChunkStream(c)
@@ -280,10 +281,6 @@ func (c *Conn) handleDataMsg(cs *ChunkStream, chunk *Chunk) error {
 	return nil
 }
 
-func (c *Conn) handleSharedObjectMsg(cs *ChunkStream) error {
-	return nil
-}
-
 func (c *Conn) handleAudioMsg(cs *ChunkStream, chunk *Chunk) error {
 	buf, err := cs.readAMFBody(chunk.Length, c.clientChunkSize)
 	if err != nil {
@@ -304,14 +301,87 @@ func (c *Conn) handleVideoMsg(cs *ChunkStream, chunk *Chunk) error {
 		return err
 	}
 
+	if len(buf) == 0 {
+		logFields := log.Fields{"timestamp": chunk.Timestamp, "payloadLen": 0}
+		if c.info != nil && c.info.Name != "" {
+			logFields["streamName"] = c.info.Name
+		}
+		log.WithFields(logFields).Warn("Empty video packet received from publisher.")
+		packet := NewPacket(typeVideo, chunk.Timestamp, chunk.StreamID, buf)
+		c.broadcast <- packet
+		return nil
+	}
+
+	frameType := (buf[0] & 0xf0) >> 4
+	codecID := buf[0] & 0x0f
+
+	logFields := log.Fields{
+		"timestamp":  chunk.Timestamp,
+		"payloadLen": len(buf),
+		"frameType":  frameType,
+		"codecID":    codecID,
+	}
+	if c.info != nil && c.info.Name != "" {
+		logFields["streamName"] = c.info.Name
+	}
+
+	switch codecID {
+	case 7: // H.264 or x264
+		var avcPacketType byte
+		var compositionTime int32
+		var relevantPayload []byte
+
+		if len(buf) > 1 {
+			avcPacketType = buf[1]
+			logFields["avcPacketType"] = avcPacketType
+
+			switch avcPacketType {
+			case 0: // AVC Sequence Header
+				if len(buf) > 2 {
+					relevantPayload = buf[2:]
+				}
+			case 1: // AVC NALU
+				if len(buf) >= 5 {
+					compositionTime = bin.I24BE(buf[2:5])
+					relevantPayload = buf[5:]
+				} else {
+					log.WithFields(logFields).Warn("H.264 NALU packet too short for CompositionTime.")
+					relevantPayload = buf[2:]
+				}
+			case 2: // End of Sequence
+				if len(buf) > 2 {
+					relevantPayload = buf[2:]
+				}
+			default:
+				log.WithFields(logFields).Warn("Unknown AVC Packet Type.")
+				relevantPayload = buf[2:]
+			}
+		} else {
+			log.WithFields(logFields).Warn("H.264 packet too short to read AVCPacketType.")
+			relevantPayload = buf[1:]
+		}
+
+		logFields["compositionTime"] = compositionTime
+		logFields["payloadHex"] = hex.EncodeToString(relevantPayload[:min(10, len(relevantPayload))])
+		log.WithFields(logFields).Debug("H.264/x264 video data received from publisher.")
+
+	default: // Non-H.264 codec
+		logFields["payloadHex"] = hex.EncodeToString(buf[:min(10, len(buf))])
+		log.WithFields(logFields).Debug("Non-H.264 video data received from publisher.")
+	}
+
+	// Always forward the packet
 	packet := NewPacket(typeVideo, chunk.Timestamp, chunk.StreamID, buf)
 	c.broadcast <- packet
 
 	return nil
 }
 
-func (c *Conn) handleAggregateMsg() error {
-	return nil
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Protocol Control Messages
@@ -742,7 +812,7 @@ func (c *Conn) broadcastVideo() {
 			continue
 		} else if len(c.broadcast) == cap(c.broadcast) && len(viewers) == 0 {
 			// Packet buffer is full, but no viewer yet, drop the oldest packet
-			//log.Info("Packet buffer is full, dropping packet...")
+			log.Info("Packet buffer is full, dropping packet...")
 			<-c.broadcast
 			continue
 		}
@@ -758,17 +828,7 @@ func (c *Conn) broadcastVideo() {
 				for _, viewer := range viewers {
 					select {
 					case viewer.player <- chunk:
-						// Packet sent successfully
-					default:
-						// Log that the packet is being dropped for this specific viewer
-						if viewer.info != nil {
-							log.WithFields(log.Fields{
-								"streamName": viewer.info.Name,
-								"viewerAddr": viewer.RemoteAddr().String(),
-							}).Warn("Dropping packet for viewer; player buffer full.")
-						} else {
-							log.WithField("viewerAddr", viewer.RemoteAddr().String()).Warn("Dropping packet for anonymous viewer; player buffer full.")
-						}
+						continue
 					}
 				}
 				c.channel.lock.RUnlock()
@@ -779,20 +839,77 @@ func (c *Conn) broadcastVideo() {
 		}
 	}
 }
+func (c *Conn) playVideo_(cs *ChunkStream) {
+	for {
+		select {
+		case chunk := <-c.player:
+			// Exit immediately if closed
+			if c.closed {
+				log.WithField("streamName", c.info.Name).Info("playVideo quit (closed).")
+				return
+			}
 
+			if len(c.player) > 1 && chunk.TypeID == typeIDVideoMsg {
+				// Try to decode frame type
+				if len(chunk.Data) >= 1 {
+					frameType := (chunk.Data[0] >> 4) & 0x0F // FLV VideoTagHeader FrameType
+					if frameType != 1 {                      // 1 = keyframe, 2 = inter frame, 3 = disposable
+						log.WithFields(log.Fields{
+							"streamName": c.info.Name,
+							"timestamp":  chunk.Timestamp,
+							"viewerAddr": c.RemoteAddr().String(),
+						}).Warn("Dropping non-keyframe video chunk due to high buffer")
+						continue
+					}
+				}
+			}
+
+			// Logging
+			log.WithFields(log.Fields{
+				"streamName": c.info.Name,
+				"viewerAddr": c.RemoteAddr().String(),
+				"chunkType":  chunk.TypeID,
+				"timestamp":  chunk.Timestamp,
+				"size":       chunk.Length,
+			}).Debug("Sending chunk to client")
+
+			// Write to client
+			if err := cs.writeChunk(chunk, c.chunkSize); err != nil {
+				log.WithFields(log.Fields{
+					"streamName": c.info.Name,
+					"viewerAddr": c.RemoteAddr().String(),
+					"chunkType":  chunk.TypeID,
+					"error":      err,
+				}).Error("Failed to write chunk to client")
+			}
+
+		case <-c.quit:
+			log.WithField("streamName", c.info.Name).Info("playVideo quit (quit signal).")
+			return
+		}
+	}
+}
 func (c *Conn) playVideo(cs *ChunkStream) {
 	for {
 		select {
 		case chunk := <-c.player:
-			// Double check if the connection has not been closed yet
 			if c.closed {
 				log.WithField("streamName", c.info.Name).Info("playVideo quit.")
-				break
+				return
 			}
-			cs.writeChunk(chunk, c.chunkSize)
+
+			err := cs.writeChunk(chunk, c.chunkSize)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"streamName": c.info.Name,
+					"error":      err,
+				}).Error("Failed to write chunk to client network.")
+				return
+			}
+
 		case <-c.quit:
-			log.WithField("streamName", c.info.Name).Info("playVideo quit.")
-			break
+			log.WithField("streamName", c.info.Name).Info("playVideo quit due to quit signal.")
+			return
 		}
 	}
 }
@@ -803,18 +920,51 @@ func (p *Packet) decode() (chunk *Chunk) {
 		audio := flv.DecodeAudio(p.data)
 		data := append(audio.AudioTagHeader.Encode(), audio.Data...)
 		chunk = NewAudioChunk(p.timestamp, p.streamID, data)
+
 		log.WithFields(log.Fields{
 			"length":    len(data),
 			"timestamp": p.timestamp,
 		}).Debug("Decoded audio packet.")
+
 	case typeVideo:
-		video := flv.DecodeVideo(p.data)
-		data := append(video.VideoTagHeader.Encode(), video.Data...)
-		chunk = NewVideoChunk(p.timestamp, p.streamID, data)
-		log.WithFields(log.Fields{
-			"length":    len(data),
-			"timestamp": p.timestamp,
-		}).Debug("Decoded video packet.")
+		video := flv.DecodeVideo(p.data) // video is *flv.VideoBody
+
+		if video.VideoTagHeader.CodecID == 7 { // H.264/AVC
+			payloadPreviewLen := 10
+			if len(video.Data) < payloadPreviewLen {
+				payloadPreviewLen = len(video.Data)
+			}
+
+			log.WithFields(log.Fields{
+				"timestamp":       p.timestamp,
+				"streamID":        p.streamID,
+				"codecID":         video.VideoTagHeader.CodecID,
+				"frameType":       video.VideoTagHeader.FrameType,
+				"avcPacketType":   video.VideoTagHeader.AVCPacketType,
+				"compositionTime": video.VideoTagHeader.CompositionTime,
+				"payloadLen":      len(video.Data),
+				"payloadHex":      hex.EncodeToString(video.Data[:payloadPreviewLen]),
+			}).Debug("H.264 video packet details (after FLV decode, before chunking).")
+
+			// Optionally: Prepend sequence header if this is a keyframe
+			// NOTE: Make sure the sequence header (AVCPacketType == 0) is sent earlier
+			// You might store & reuse it in your application layer
+
+			// Rebuild full FLV video tag
+			data := append(video.VideoTagHeader.Encode(), video.Data...)
+			chunk = NewVideoChunk(p.timestamp, p.streamID, data)
+
+		} else {
+			// Non-H264
+			data := append(video.VideoTagHeader.Encode(), video.Data...)
+			chunk = NewVideoChunk(p.timestamp, p.streamID, data)
+
+			log.WithFields(log.Fields{
+				"length":    len(data),
+				"timestamp": p.timestamp,
+			}).Debug("Decoded non-H.264 video packet.")
+		}
+
 	default:
 		log.WithField("type", p.packetType).Error("Cannot play unknown type packet")
 	}
